@@ -104,6 +104,7 @@ class Trainer:
             use_augmentations=hparams["modalities"]["pre_processings"][
                 "use_augmentation"
             ],
+            use_txt=False,
         )
         dataloader = self.datamodule._create_dataloader(
             dataset_val,
@@ -121,6 +122,7 @@ class Trainer:
             use_augmentations=hparams["modalities"]["pre_processings"][
                 "use_augmentation"
             ],
+            use_txt=False,
         )
 
         dataloader = self.datamodule._create_dataloader(
