@@ -261,6 +261,7 @@ class SRDiffTrainer(Trainer):
         labels = sample["labels"]
         dates = sample["dates_encoding"]
         closest_idx = sample["closest_idx"]  # torch.Size([4, 2, 3, 160, 160])
+        # img_hr_down = img_hr_down[:, :4, :, :]
 
         img_sr, final_loss = self.model.gaussian.sample(
             img_hr,  # HR image for conditioning
@@ -269,8 +270,9 @@ class SRDiffTrainer(Trainer):
             img_hr_down,
             img_lr,
             img_lr_up,
-            dates,
-            closest_idx,
+            dates=dates,
+            closest_idx=closest_idx,
+            # custom_steps=hparams["num_ddim_timesteps"],
         )
 
         # print("img_sr infer:", img_sr.shape)

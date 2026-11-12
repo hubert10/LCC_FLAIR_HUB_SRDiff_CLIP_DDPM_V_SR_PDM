@@ -18,6 +18,7 @@ from models.diffusion.modules.encoders.modules import FrozenOpenCLIPEmbedder
 from models.diffusion.utils import default, disabled_train
 from diffusers.models.vae import DiagonalGaussianDistribution
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+from models.diffusion.ddim_sampler import DDIMSampler
 
 
 def extract(a, t, x_shape):
@@ -104,24 +105,17 @@ class GaussianDiffusion(nn.Module):
         # condition network, which is either RRDBLTAENet or HighResLTAENet
         # for satelite image time series integration
         self.cond_net = cond_net
-
-        for name, param in self.cond_net.named_parameters():
-            if "attn" not in name:
-                param.requires_grad = False
-            else:
-                param.requires_grad = False
-
         self.cond_stage_forward = cond_stage_forward
         # eval() controls the behavior of modules such as Dropout and BatchNorm.
         self.denoise_net.eval()
         # self.model.train = disabled_train
  
-        # for name, param in self.denoise_net.named_parameters():
-        #     if "attn" not in name:
-        #         param.requires_grad = False
-        #     else:
-        #         # requires_grad=True controls whether PyTorch computes gradients for those parameters.
-        #         param.requires_grad = True
+        for name, param in self.denoise_net.named_parameters():
+            if "attn" not in name:
+                param.requires_grad = False
+            else:
+                # requires_grad=True controls whether PyTorch computes gradients for those parameters.
+                param.requires_grad = True
 
         # Setup the CLIP model - use pretrained weights
         self.cond_stage_model = FrozenOpenCLIPEmbedder(hparams)
@@ -293,93 +287,17 @@ class GaussianDiffusion(nn.Module):
 
     @torch.no_grad()
     def apply_cond_hr_encoder(self, img_hr):
-        _, _, res2, res3, res4 = self.aer_net_enc(img_hr)
+        _, _, hr_2, hr_3, hr_4 = self.aer_net_enc(img_hr)
 
         # print("res2:", res2.shape)
         # print("res3:", res3.shape)
         # print("res4:", res4.shape)
 
-        # res2: torch.Size([1, 128, 64, 64]): 1.6 m GSD
-        # res3: torch.Size([1, 256, 32, 32]): 3.2 m GSD
-        # res4: torch.Size([1, 512, 16, 16]): 6.2 m GSD
+        # torch.Size([2, 128, 64, 64])
+        # torch.Size([2, 256, 32, 32])
+        # torch.Size([2, 512, 16, 16])
+        return [hr_2, hr_3, hr_4]
 
-        return [res2, res3, res4]
-
-    # TRAINING STEP
-
-    def forward(
-        self,
-        img_hr,
-        txt,
-        mtd,
-        img_hr_down,  # High-resolution (HR) image
-        img_lr,  # Low-resolution (LR) input
-        img_lr_up,  # Upsampled LR image
-        dates=None,  # Additional temporal information (for LTAE)
-        closest_idx=None,  # Closest index for temporal features
-        t=None,  # Diffusion timestep
-        alphas=None,  # Auxiliary parameters (for HighResNet)
-        *args,
-        **kwargs
-    ):
-        x = img_hr_down
-        b, *_, device = *x.shape, x.device
-
-        # Randomly select a timestep:
-        # if t is None(Not given), then randomly choose a timestep from 0 to num_timesteps
-        # t is a tensor of shape batch size tensor([1, 3, 4, 1, 0]) for 5 images in a batch size
-
-        t = (
-            torch.randint(0, self.num_timesteps, (b,), device=device).long()
-            if t is None
-            else torch.LongTensor([t]).repeat(b).to(device)
-        )
-        # cond: extracted temporal features from the low-resolution image
-        # encoded with HighResnet-LTAE temporal encoder
-
-        cond_lr = self.apply_cond_lr_encoder(img_lr, dates)
-
-        with torch.no_grad():
-            txt = self.get_learned_conditioning(txt)
-            cond_hr = self.apply_cond_hr_encoder(img_hr)
-
-        # print("cond 0:", cond[0].shape)
-        # print("cond 1:", cond[1].shape)
-        # print("cond 2:", cond[2].shape)
-        # print("cond 3:", cond[3].shape)
-
-        # cond 0: torch.Size([2, 12, 64, 10, 10]): 10 m GSD
-        # cond 1: torch.Size([2, 12, 128, 5, 5]): 20 m GSD
-        # cond 2: torch.Size([2, 12, 256, 3, 3]): 40 m GSD
-        # cond 3: torch.Size([2, 12, 512, 2, 2]): 80 m GSD
-
-        # cond: shape (B, T, C, H, W) where T is the number of time steps
-        # img_lr_up: shape (B, T, C, H, W) where T is the number of time steps
-
-        p_losses, x_tp1, noise_pred, x_t, x_t_gt, x_0 = self.p_losses(
-            x,
-            t,
-            txt,
-            mtd,
-            cond_lr,
-            cond_hr,
-            img_lr,
-            img_lr_up,
-            closest_idx,
-            *args,
-            **kwargs
-        )
-        # p_losses: main loss computed based on the predicted noise and the ground truth noise
-        ret = {"sr": p_losses}
-
-        # If the cond_net parameters are not froozen, apply auxiliary losses
-        # to the output of the cond_net (RRDB) to refine the features
-
-        # return ret: loss dict (noise diffusion loss + auxiliary losses)
-        # predicted SR image (x_tp1) at  currenttimestep t
-        # intermediate noisy versions (x_t_gt, x_t) at current timestep t
-        # x_0: predicted denoised image (without noise) at the current timestep
-        return ret, (x_tp1, x_t_gt, x_t), t, x_0
 
     def p_losses(
         self,
@@ -547,6 +465,84 @@ class GaussianDiffusion(nn.Module):
     # at timestep t-1 based on the predicted noise and other parameters.
 
     # p_sample performs one step of the reverse diffusion process:
+
+    # TRAINING STEP
+
+    def forward(
+        self,
+        img_hr,
+        txt,
+        mtd,
+        img_hr_down,  # High-resolution (HR) image
+        img_lr,  # Low-resolution (LR) input
+        img_lr_up,  # Upsampled LR image
+        dates=None,  # Additional temporal information (for LTAE)
+        closest_idx=None,  # Closest index for temporal features
+        t=None,  # Diffusion timestep
+        alphas=None,  # Auxiliary parameters (for HighResNet)
+        *args,
+        **kwargs
+    ):
+        x = img_hr_down
+        b, *_, device = *x.shape, x.device
+
+        # Randomly select a timestep:
+        # if t is None(Not given), then randomly choose a timestep from 0 to num_timesteps
+        # t is a tensor of shape batch size tensor([1, 3, 4, 1, 0]) for 5 images in a batch size
+
+        t = (
+            torch.randint(0, self.num_timesteps, (b,), device=device).long()
+            if t is None
+            else torch.LongTensor([t]).repeat(b).to(device)
+        )
+        # cond: extracted temporal features from the low-resolution image
+        # encoded with HighResnet-LTAE temporal encoder
+
+        cond_lr = self.apply_cond_lr_encoder(img_lr, dates)
+
+        with torch.no_grad():
+            txt = self.get_learned_conditioning(txt)
+            cond_hr = self.apply_cond_hr_encoder(img_hr)
+
+        # print("cond 0:", cond[0].shape)
+        # print("cond 1:", cond[1].shape)
+        # print("cond 2:", cond[2].shape)
+        # print("cond 3:", cond[3].shape)
+
+        # cond 0: torch.Size([2, 12, 64, 10, 10]): 10 m GSD
+        # cond 1: torch.Size([2, 12, 128, 5, 5]): 20 m GSD
+        # cond 2: torch.Size([2, 12, 256, 3, 3]): 40 m GSD
+        # cond 3: torch.Size([2, 12, 512, 2, 2]): 80 m GSD
+
+        # cond: shape (B, T, C, H, W) where T is the number of time steps
+        # img_lr_up: shape (B, T, C, H, W) where T is the number of time steps
+
+        p_losses, x_tp1, noise_pred, x_t, x_t_gt, x_0 = self.p_losses(
+            x,
+            t,
+            txt,
+            mtd,
+            cond_lr,
+            cond_hr,
+            img_lr,
+            img_lr_up,
+            closest_idx,
+            *args,
+            **kwargs
+        )
+        # p_losses: main loss computed based on the predicted noise and the ground truth noise
+        ret = {"sr": p_losses}
+
+        # If the cond_net parameters are not froozen, apply auxiliary losses
+        # to the output of the cond_net (RRDB) to refine the features
+
+        # return ret: loss dict (noise diffusion loss + auxiliary losses)
+        # predicted SR image (x_tp1) at  currenttimestep t
+        # intermediate noisy versions (x_t_gt, x_t) at current timestep t
+        # x_0: predicted denoised image (without noise) at the current timestep
+        return ret, (x_tp1, x_t_gt, x_t), t, x_0
+
+
 
     @torch.no_grad()
     def p_sample(
@@ -751,30 +747,201 @@ class GaussianDiffusion(nn.Module):
     # where the network predicts the residual (difference)
     # instead of the full high-resolution image.
 
-    def res2img(self, res, img_lr_up, clip_input=None):
-        res = res[:, :4, :, :]
+    def apply_model(
+        self,
+        x_noisy: torch.Tensor,
+        t: int,
+        txt: torch.Tensor,
+        mtd: torch.Tensor,
+        cond_lr: Optional[torch.Tensor] = None,
+        cond_hr: Optional[torch.Tensor] = None,
+        return_ids: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Applies the model to the given noisy (latent) input tensor.
+
+        Args:
+            x_noisy (torch.Tensor): The noisy input tensor.
+            t (int): The timestep.
+            cond (Optional[torch.Tensor]): The conditioning tensor.
+            return_ids (bool): Whether to return the IDs of the diffusion process.
+
+        Returns:
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]: The output tensor, and optionally the IDs of the
+            diffusion process.
+            returns a latent, which is then used for loss computation
+            So the loss is computed directly on the latent space, not the decoded image.
+        """
+
+        # diffusion prediction
+        x_recon = self.denoise_net(
+            x_noisy,
+            t,
+            encoder_hidden_states=txt,
+            class_labels=None,
+            metadata=mtd,
+            down_block_additional_residuals=cond_lr,
+            up_block_additional_residuals=cond_hr,
+        )
+
+        if isinstance(x_recon, tuple) and not return_ids:
+            # print("x_recon[0]", x_recon[0].shape)
+            return x_recon[0]
+        else:
+            # print("x_recon", x_recon.shape) # torch.Size([2, 4, 16, 16])
+            return x_recon
+
+    def _prepare_model(
+        self,
+        X: torch.Tensor,
+        eta: float = 1.0,
+        custom_steps: int = 100,
+        verbose: bool = False,
+    ):
+        # Create the DDIM sampler with uses 100 time steps during inference
+        ddim = DDIMSampler(self)
+
+        # print("X:", X.shape)
+        # print("_prepare_model custom_steps:", custom_steps)
+        # make schedule to compute alphas and sigmas
+        ddim.make_schedule(ddim_num_steps=custom_steps, ddim_eta=eta, verbose=verbose)
+
+        # Create the vector with the timesteps
+        timesteps = ddim.ddim_timesteps
+        time_range = np.flip(timesteps)
+
+        return ddim, time_range
+
+    # INFERENCE/SAMPLING STEP
+
+    # This function returs:
+    # Return	Meaning	Purpose
+    # 1. x_{t-1} -- New sample after denoising and resampling
+    # Used to proceed to next step in reverse process
+    # 2.  x_0 -- Denoised image at current step	For visualization
+    # or intermediate loss computation
+
+    @torch.no_grad()
+    def sample(
+        self,
+        img,  # HR image used for conditioning
+        txt,
+        mtd,  # metadata for conditioning
+        img_hr,
+        img_lr,  # LR image used for conditioning
+        img_lr_up,
+        dates,
+        closest_idx,
+        eta: float = 1.0,
+        temperature: float = 1.0,
+        custom_steps: int = 100,  # used for inference
+        verbose: bool = False,
+        histogram_matching: bool = True,
+        save_iterations: bool = False,
+    ):
+        
+        with torch.no_grad():
+            txt = self.get_learned_conditioning(txt)
+            cond_hr = self.apply_cond_hr_encoder(img)
+            cond_lr = self.apply_cond_lr_encoder(img_lr, dates)
+
+        # Normalize the image
+        img_hr = img_hr.clone()
+        # Xnorm = self._tensor_encode(X)  # torch.Size([1, 4, 16, 16])
+        # ddim, latent and time_range
+        ddim, time_range = self._prepare_model(
+            X=img_hr, eta=eta, custom_steps=custom_steps, verbose=verbose
+        )
+
+        sr_images = []
+
+        for j in range(img_lr.shape[1]):
+            # Each timestep in the reverse diffusion process is conditioned
+            # the corresponding temporal features from the LR image
+
+            # Create the HR latent image
+            img = torch.randn(img_hr.shape, device=img_hr.device)
+            # print("latent:", latent.shape)
+
+            iterator = tqdm(
+                time_range, desc="DDIM Sampler", total=custom_steps, disable=True
+            )
+
+            # Iterate over the timesteps
+            if save_iterations:
+                save_iters = []
+
+            for i, step in enumerate(iterator):
+                img, _ = ddim.p_sample_ddim(
+                    x=img,  # Random noise generated from encoded HR aerial image
+                    t=step,
+                    txt=txt,
+                    mtd=mtd,
+                    c=[feat[:, j] for feat in cond_lr],  # Encoded LR Sentinel-2 images
+                    cond_hr=cond_hr,  # HR image
+                    index=custom_steps - i - 1,
+                    use_original_steps=False,
+                    temperature=temperature,
+                )
+
+                if save_iterations:
+                    save_iters.append(img)
+
+            if save_iterations:
+                return save_iters
+
+            sr_out = self.res2img(img, img_lr_up[:, j, :, :])
+            sr_images.append(sr_out)
+        img_sr = torch.stack(sr_images, 1)  # torch.Size([2, 4, 4, 64, 64]
+        sr_pred = self.closest_lr_sits_aer(img_sr, closest_idx)
+        loss = self.get_loss(sr_pred, img_hr)
+        # If you want a robust prediction, aggregate time-series predictions
+        # Average logits over time (assuming model refines over time)
+
+        # auxiliary losses computations
+        aux_loss = (
+            hparams["px_loss_weight"]
+            * pixel_wise_closest_sr_sits_aer_loss(img_sr, img_hr, closest_idx)
+            + hparams["grad_px_loss_weight"]
+            * grad_pixel_wise_closest_sr_sits_aer_loss(img_sr, img_hr, closest_idx)
+            + hparams["temp_grad_mag_loss_weight"]
+            * temp_gradient_magnitude_consistency_loss(img_sr)
+            + hparams["gray_value_px_loss_weight"]
+            * gray_value_consistency_loss(img_sr, img_lr)
+        )
+        final_loss = hparams["main_loss_weight"] * loss + aux_loss
+        return img_sr, final_loss
+
+    # Convert a residual image back to the original scale
+    # by adding back an upsampled low-resolution image
+    # This is a common technique in super-resolution models
+    # where the network predicts the residual (difference)
+    # instead of the full high-resolution image.
+
+    def res2img(self, img_, img_lr_up, clip_input=None):
+        img_ = img_[:, :4, :, :]
         if clip_input is None:
             clip_input = hparams["clip_input"]
         if hparams["res"]:
             if clip_input:
-                res = res.clamp(-1, 1)
+                img_ = img_.clamp(-1, 1)
             # rescales the residual image before adding it to the upsampled LR image
             # with a scaling factor defined by hparams['res_rescale'] for stability.
-            img = res / hparams["res_rescale"] + img_lr_up
-        return img
+            img_ = img_ / hparams["res_rescale"] + img_lr_up
+        return img_
 
-    def img2res(self, img, img_lr_up, clip_input=None):
+    def img2res(self, x, img_lr_up, clip_input=None):
         # Compute Residual Between HR and LR-upsampled image
         # Subtract the upsampled LR image from the HR image
         # to obtain the residual.
 
         # x: torch.Size([5, 3, 40, 40])
         # img_lr_up: torch.Size([5, 2, 3, 40, 40])
-        img = img[:, :4, :, :]
+        x = x[:, :4, :, :]
         if clip_input is None:
             clip_input = hparams["clip_input"]
         if hparams["res"]:
-            res = (img - img_lr_up) * hparams["res_rescale"]
+            x = (x - img_lr_up) * hparams["res_rescale"]
             if clip_input:
-                res = res.clamp(-1, 1)
-        return res
+                x = x.clamp(-1, 1)
+        return x
