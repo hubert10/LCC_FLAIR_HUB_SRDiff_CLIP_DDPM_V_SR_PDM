@@ -210,7 +210,7 @@ class FLAIRDataSet(Dataset):
         tif_path: str,
         lut_classes: dict,
         min_ratio: float = 0.01,
-        max_classes: int = 6,
+        max_classes: int = 15,
         image_type: str = "aerial",
     ) -> str:
         """
